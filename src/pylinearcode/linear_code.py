@@ -8,6 +8,7 @@ from math import prod
 from typing import Iterator, Sequence
 
 from .bounds import singleton_bound
+from .enumerators import macwilliams_transform
 from .exceptions import ComputationLimitError, LinearCodeError
 from .fields import FiniteField
 from .matrix import (
@@ -154,7 +155,20 @@ class LinearCode:
         for message in product(range(self.field.q), repeat=self.dimension):
             yield self.encode(message)
 
-    def minimum_weight_codeword(self, *, max_codewords: int = 1_000_000) -> tuple[int, Vector]:
+    def minimum_weight_codeword(
+        self,
+        *,
+        max_codewords: int = 1_000_000,
+        algorithm: str = "auto",
+        max_supports: int = 1_000_000,
+    ) -> tuple[int, Vector]:
+        if algorithm not in {"auto", "codewords", "parity_check"}:
+            raise ValueError("algorithm must be 'auto', 'codewords', or 'parity_check'")
+        if algorithm == "parity_check":
+            return self.minimum_weight_codeword_by_parity_check(max_supports=max_supports)
+        if algorithm == "auto" and self.cardinality - 1 > max_codewords:
+            return self.minimum_weight_codeword_by_parity_check(max_supports=max_supports)
+
         if self.dimension == 0:
             return 0, [0] * self.length
         total = self.cardinality - 1
@@ -179,14 +193,68 @@ class LinearCode:
         assert best_word is not None
         return best_weight, best_word
 
-    def minimum_distance(self, *, max_codewords: int = 1_000_000) -> int:
-        return self.minimum_weight_codeword(max_codewords=max_codewords)[0]
+    def minimum_weight_codeword_by_parity_check(
+        self, *, max_weight: int | None = None, max_supports: int = 1_000_000
+    ) -> tuple[int, Vector]:
+        """Find a minimum word via dependent column sets of a parity-check matrix.
+
+        This is exact and can be dramatically faster than enumerating all
+        codewords when the dimension is large and the target distance is small.
+        """
+
+        if self.dimension == 0:
+            return 0, [0] * self.length
+        if max_weight is None:
+            max_weight = singleton_bound(self.length, self.dimension)
+        h = self.parity_check_matrix
+        checked = 0
+        for weight in range(1, max_weight + 1):
+            for support in combinations(range(self.length), weight):
+                checked += 1
+                if checked > max_supports:
+                    raise ComputationLimitError(
+                        f"parity-check search exceeded {max_supports} supports"
+                    )
+                submatrix = [[row[j] for j in support] for row in h]
+                if rank(self.field, submatrix, ncols=weight) == weight:
+                    continue
+                dependencies = nullspace(self.field, submatrix, ncols=weight)
+                if not dependencies:
+                    continue
+                word = [0] * self.length
+                for index, value in zip(support, dependencies[0]):
+                    word[index] = value
+                actual_weight = hamming_weight(word)
+                if actual_weight:
+                    return actual_weight, word
+        raise ComputationLimitError(f"no nonzero codeword found up to weight {max_weight}")
+
+    def minimum_distance(
+        self,
+        *,
+        max_codewords: int = 1_000_000,
+        algorithm: str = "auto",
+        max_supports: int = 1_000_000,
+    ) -> int:
+        return self.minimum_weight_codeword(
+            max_codewords=max_codewords, algorithm=algorithm, max_supports=max_supports
+        )[0]
 
     def weight_distribution(self, *, max_codewords: int = 1_000_000) -> dict[int, int]:
         distribution = {weight: 0 for weight in range(self.length + 1)}
         for word in self.codewords(max_codewords=max_codewords):
             distribution[hamming_weight(word)] += 1
         return distribution
+
+    def dual_weight_distribution(self, *, max_codewords: int = 1_000_000) -> dict[int, int]:
+        """Return the dual distribution using MacWilliams, not dual enumeration."""
+
+        return macwilliams_transform(
+            self.weight_distribution(max_codewords=max_codewords),
+            q=self.field.q,
+            length=self.length,
+            dimension=self.dimension,
+        )
 
     def distance(self, left: Sequence[int], right: Sequence[int]) -> int:
         return hamming_distance(
@@ -293,6 +361,39 @@ class LinearCode:
         error = self.coset_leader(self.syndrome(r), max_weight=max_weight)
         return vector_sub(self.field, r, error), error
 
+    def syndrome_table(
+        self, *, max_weight: int | None = None, max_errors: int = 1_000_000
+    ) -> dict[tuple[int, ...], Vector]:
+        """Return syndrome-to-coset-leader entries in increasing error weight."""
+
+        if max_weight is None:
+            max_weight = self.length
+        target_size = self.field.q**self.redundancy
+        table: dict[tuple[int, ...], Vector] = {tuple([0] * self.redundancy): [0] * self.length}
+        nonzero = list(self.field.nonzero_elements())
+        visited = 0
+        for weight in range(1, max_weight + 1):
+            for support in combinations(range(self.length), weight):
+                for values in product(nonzero, repeat=weight):
+                    visited += 1
+                    if visited > max_errors:
+                        raise ComputationLimitError(
+                            f"syndrome-table construction exceeded {max_errors} errors"
+                        )
+                    error = [0] * self.length
+                    for pos, value in zip(support, values):
+                        error[pos] = value
+                    table.setdefault(tuple(self.syndrome(error)), error)
+                    if len(table) == target_size:
+                        return table
+        return table
+
+    def covering_radius(self, *, max_weight: int | None = None, max_errors: int = 1_000_000) -> int:
+        table = self.syndrome_table(max_weight=max_weight, max_errors=max_errors)
+        if len(table) != self.field.q**self.redundancy:
+            raise ComputationLimitError("syndrome table did not cover all cosets")
+        return max(hamming_weight(error) for error in table.values())
+
     # Magma/Sage-style aliases for users porting notebooks or scripts.
     GeneratorMatrix = generator_matrix
     ParityCheckMatrix = parity_check_matrix
@@ -300,6 +401,7 @@ class LinearCode:
     Hull = hull
     MinimumDistance = minimum_distance
     WeightDistribution = weight_distribution
+    DualWeightDistribution = dual_weight_distribution
     Syndrome = syndrome
 
 
@@ -330,4 +432,3 @@ def direct_sum(left: LinearCode, right: LinearCode) -> LinearCode:
 
 def expected_codewords(code: LinearCode) -> int:
     return prod([code.field.q] * code.dimension)
-
